@@ -189,8 +189,8 @@ def post_detail(request, post_id):
 
     if post.author != request.user:
         if (
-            not post.is_published or not post.category.is_published or
-            post.pub_date > timezone.now()
+            not post.is_published or not post.category.is_published
+            or post.pub_date > timezone.now()
         ):
             raise Http404()
 
