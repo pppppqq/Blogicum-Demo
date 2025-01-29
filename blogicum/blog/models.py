@@ -44,7 +44,7 @@ class Post(PublishedCreatedModel):
         help_text=(
             'Если установить дату и время в будущем — '
             'можно делать отложенные публикации.'
-        )
+        ),
     )
     author = models.ForeignKey(
         User,
@@ -75,12 +75,6 @@ class Post(PublishedCreatedModel):
     class Meta:
         verbose_name = 'публикация'
         verbose_name_plural = 'Публикации'
-
-        ordering = ('-pub_date', 'title')
-
-    @property
-    def comment_count(self):
-        return self.comments.count()
 
     def get_absolute_url(self):
         return reverse('blog:post_detail', kwargs={'id': self.id})
@@ -146,9 +140,15 @@ class Comment(models.Model):
         related_name='comments',
     )
     created_at = models.DateTimeField(auto_now_add=True)
-    author = models.ForeignKey(User, on_delete=models.CASCADE)
+    author = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='comments'
+    )
 
     class Meta:
+        verbose_name = 'комментарий'
+        verbose_name_plural = 'Комментарии'
         ordering = ('created_at',)
 
     def __str__(self):

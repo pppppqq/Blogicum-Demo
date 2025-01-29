@@ -10,6 +10,8 @@ CSRF_FAILURE_VIEW = 'pages.views.csrf_failure'
 
 LOGIN_REDIRECT_URL = 'blog:index'
 
+COUNT_POSTS = 10
+
 LOGIN_URL = 'login'
 
 MEDIA_ROOT = BASE_DIR / 'media'

@@ -1,5 +1,3 @@
-from datetime import datetime
-
 from django.views.generic import (CreateView, ListView, UpdateView)
 from django.shortcuts import render, get_object_or_404, redirect
 from django.core.paginator import Paginator
@@ -8,6 +6,9 @@ from django.urls import reverse, reverse_lazy
 from django.contrib.auth.decorators import login_required
 from django.http import Http404
 from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
+from django.conf import settings
+from django.db.models import Count
+from django.utils import timezone
 
 from .models import Post, Category, Comment
 from .forms import PostForm, CommentForm
@@ -15,92 +16,112 @@ from .forms import PostForm, CommentForm
 
 User = get_user_model()
 
+COUNT_POSTS = settings.COUNT_POSTS
+
 
 @login_required
-def add_comment(request, pk):
+def add_comment(request, post_id):
     """
     Добавляет комментарий к посту по его идентефикатору (pk).
     Комментарии могут оставить только авторизированные пользователи.
     """
-    post = get_object_or_404(Post, pk=pk)
+    post = get_object_or_404(Post, pk=post_id)
     form = CommentForm(request.POST)
     if form.is_valid():
         comment = form.save(commit=False)
         comment.author = request.user
         comment.post = post
         comment.save()
-    return redirect('blog:post_detail', pk=pk)
+    return redirect('blog:post_detail', post_id=post_id)
+
+
+def get_comment_post(post_id, comment_id):
+    """
+    Получает объект комментария по его идентификатору
+    внутри заданного поста.
+    """
+    return get_object_or_404(
+        Comment.objects.filter(pk=comment_id),
+        post=post_id
+    )
 
 
 @login_required
-def edit_comment(request, post_pk, comment_pk):
+def edit_comment(request, post_id, comment_id):
     """
     Позволяет редактировать комментарий. Если пользователь,
     который отправил запрос не является автором комментария,
     его перенаправляет на страницу публикации.
     """
-    instance = get_object_or_404(Comment, pk=comment_pk)
+    instance = get_comment_post(post_id, comment_id)
 
     if request.user != instance.author:
-        return redirect('blog:post_detail', pk=post_pk)
+        return redirect('blog:post_detail', post_id=post_id)
 
     form = CommentForm(request.POST or None, instance=instance)
     if form.is_valid():
         form.save()
-        return redirect('blog:post_detail', pk=post_pk)
+        return redirect('blog:post_detail', post_id=post_id)
 
     context = {'form': form, 'comment': instance}
     return render(request, 'blog/comment.html', context)
 
 
 @login_required
-def delete_comment(request, post_pk, comment_pk):
+def delete_comment(request, post_id, comment_id):
     """
     Удаляет комментарий к посту.
     Если пользователь, который отправил запрос не является автором
     комментария, его перенаправляет на страницу публикации.
     """
-    instance = get_object_or_404(Comment, pk=comment_pk)
+    instance = get_comment_post(post_id, comment_id)
 
     if request.user != instance.author:
-        return redirect('blog:post_detail', pk=post_pk)
+        return redirect('blog:post_detail', post_id=post_id)
 
     if request.method == 'POST':
         instance.delete()
-        return redirect('blog:post_detail', pk=post_pk)
+        return redirect('blog:post_detail', post_id=post_id)
     return render(request, 'blog/comment.html')
 
 
-def get_posts_list():
-    """Возвращает QuerySet для получения опубликованных постов."""
-    return Post.objects.select_related(
+def get_posts(add_filter=False, add_comments=False):
+    """
+    Получает набор публикаций из базы данных с возможностью применения
+    фильтров и предзагрузки комментариев.
+    Публикации загружаются с использованием оптимизации запросов,
+    чтобы уменьшить количество обращений к базе данных.
+    """
+    qwery = Post.objects.select_related(
         'author',
         'category',
         'location'
-    ).filter(
-        pub_date__lte=datetime.now(),
-        is_published=True,
-        category__is_published=True
     )
+    if add_filter:
+        qwery = qwery.filter(
+            pub_date__lte=timezone.now(),
+            is_published=True,
+            category__is_published=True
+        )
+    if add_comments:
+        qwery = qwery.prefetch_related('comments')
+    return qwery.annotate(
+        comment_count=Count('comments')
+    ).order_by('-pub_date', 'title')
 
 
 class OnlyAuthorMixin(UserPassesTestMixin):
     """
     Миксин, который проверяет, является ли пользователь, который
-    отправил запрос автором поста. Вернет False, если не является.
+    отправил запрос, автором поста. Вернет False, если не является.
     """
 
     def test_func(self):
         object = self.get_object()
         return object.author == self.request.user
 
-
-class CheckValidFormMixin:
-    """Миксин для проверки валидности формы."""
-
-    def form_valid(self, form):
-        form.instance.author = self.request.user
-        return super().form_valid(form)
+    def handle_no_permission(self):
+        return redirect('blog:post_detail', post_id=self.get_object().pk)
 
 
 class PostsListView(ListView):
@@ -111,12 +132,12 @@ class PostsListView(ListView):
 
     model = Post
     template_name = 'blog/index.html'
-    queryset = get_posts_list()
+    queryset = get_posts(add_filter=True)
 
-    paginate_by = 10
+    paginate_by = COUNT_POSTS
 
 
-class PostCreateView(CheckValidFormMixin, LoginRequiredMixin, CreateView):
+class PostCreateView(LoginRequiredMixin, CreateView):
     """
     Создает пост. Создавать посты разрешается только админу
     и авторизованным пользователям.
@@ -126,15 +147,17 @@ class PostCreateView(CheckValidFormMixin, LoginRequiredMixin, CreateView):
     form_class = PostForm
     template_name = 'blog/create.html'
 
+    def form_valid(self, form):
+        form.instance.author = self.request.user
+        return super().form_valid(form)
+
     def get_success_url(self):
         return reverse_lazy(
-            'blog:profile', kwargs={'username': self.object.author}
+            'blog:profile', kwargs={'username': self.request.user}
         )
 
 
-class PostUpdateView(
-    CheckValidFormMixin, OnlyAuthorMixin, LoginRequiredMixin, UpdateView
-):
+class PostUpdateView(LoginRequiredMixin, OnlyAuthorMixin, UpdateView):
     """
     Класс позволяет изменить детали поста.
     Редактировать пост разрешается только его автору или администратору.
@@ -145,34 +168,31 @@ class PostUpdateView(
     model = Post
     form_class = PostForm
     template_name = 'blog/create.html'
-
-    def dispatch(self, request, *args, **kwargs):
-        object = self.get_object()
-        if request.user != object.author:
-            return redirect('blog:post_detail', pk=object.pk)
-        return super().dispatch(request, *args, **kwargs)
+    pk_url_kwarg = 'post_id'
 
     def get_success_url(self):
-        return reverse_lazy('blog:post_detail', kwargs={'pk': self.object.pk})
+        return reverse_lazy(
+            'blog:post_detail', kwargs={'post_id': self.kwargs['post_id']}
+        )
 
 
-def post_detail(request, pk):
+def post_detail(request, post_id):
     """
-    Позволяет получить детали поста по указанному идентификатору (pk).
+    Позволяет получить детали поста по указанному идентификатору.
     Если пост снят с публикации или "отложен",
     его может посмотреть только автор.
     """
     post = get_object_or_404(
-        Post.objects.select_related(
-            'author',
-            'category',
-            'location'
-        ),
-        pk=pk
+        get_posts(add_filter=False, add_comments=True),
+        pk=post_id
     )
 
     if post.author != request.user:
-        post = get_object_or_404(get_posts_list(), pk=pk)
+        if (
+            not post.is_published or not post.category.is_published or
+            post.pub_date > timezone.now()
+        ):
+            raise Http404()
 
     comments = post.comments.select_related('author')
     form = CommentForm()
@@ -182,20 +202,21 @@ def post_detail(request, pk):
         'form': form,
         'comments': comments,
     }
+
     return render(request, 'blog/detail.html', context)
 
 
 @login_required
-def delete_post(request, pk):
+def delete_post(request, post_id):
     """
-    Удаляет пост по указанному идентификатору (pk), если текущий пользователь
+    Удаляет пост по указанному идентификатору, если текущий пользователь
     является автором этого поста. Если пользователь не является автором,
     происходит перенаправление на страницу деталей поста.
     """
-    instance = get_object_or_404(Post, pk=pk)
+    instance = get_object_or_404(Post, pk=post_id)
 
     if request.user != instance.author:
-        return redirect('blog:post_detail', pk=pk)
+        return redirect('blog:post_detail', post_id=post_id)
 
     form = PostForm(instance=instance)
     context = {'form': form}
@@ -221,13 +242,20 @@ class ProfileUpdateView(LoginRequiredMixin, UpdateView):
     fields = ['first_name', 'last_name', 'username', 'email']
 
     def get_object(self, queryset=None):
-        if self.request.user.is_authenticated:
-            return self.request.user
-        raise Http404()
+        return self.request.user
 
     def get_success_url(self):
         user = self.get_object()
         return reverse('blog:profile', kwargs={'username': user.username})
+
+
+def get_page_obj(request, paginator):
+    """
+    Получает объект страницы из пагинатора на основе номера страницы,
+    указанного в параметрах запроса.
+    """
+    page_number = request.GET.get('page')
+    return paginator.get_page(page_number)
 
 
 def profile_details(request, username):
@@ -236,17 +264,22 @@ def profile_details(request, username):
     о нем и опубликованные посты.
     """
     profile = get_object_or_404(
-        User.objects.filter(
-            username=username
-        ))
+        User.objects.all(),
+        username=username
+    )
 
-    paginator = Paginator(Post.objects.all().filter(author=profile), 10)
-    page_number = request.GET.get('page')
-    page_obj = paginator.get_page(page_number)
+    if request.user == profile:
+        posts = get_posts()
+    else:
+        posts = get_posts(add_filter=True)
+
+    paginator = Paginator(
+        posts.filter(author=profile), COUNT_POSTS
+    )
 
     context = {
         'profile': profile,
-        'page_obj': page_obj
+        'page_obj': get_page_obj(request, paginator)
     }
 
     return render(request, 'blog/profile.html', context)
@@ -261,12 +294,13 @@ def category_posts(request, category_slug):
         is_published=True,
     )
 
-    paginator = Paginator(get_posts_list().filter(category=category), 10)
-    page_number = request.GET.get('page')
-    page_obj = paginator.get_page(page_number)
+    paginator = Paginator(
+        get_posts(add_filter=True).filter(category=category),
+        COUNT_POSTS
+    )
 
     context = {
         'category': category,
-        'page_obj': page_obj
+        'page_obj': get_page_obj(request, paginator)
     }
     return render(request, 'blog/category.html', context)
