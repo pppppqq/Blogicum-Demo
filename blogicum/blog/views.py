@@ -16,7 +16,30 @@ from .forms import PostForm, CommentForm
 
 User = get_user_model()
 
-COUNT_POSTS = settings.COUNT_POSTS
+
+def get_posts(add_filter=False, add_comments=False):
+    """
+    Получает набор публикаций из базы данных с возможностью применения
+    фильтров и предзагрузки комментариев.
+    Публикации загружаются с использованием оптимизации запросов,
+    чтобы уменьшить количество обращений к базе данных.
+    """
+    query = Post.objects.select_related(
+        'author',
+        'category',
+        'location'
+    )
+    if add_filter:
+        query = query.filter(
+            pub_date__lte=timezone.now(),
+            is_published=True,
+            category__is_published=True
+        )
+    if add_comments:
+        query = query.annotate(
+            comment_count=Count('comments')
+        )
+    return query.order_by('-pub_date', 'title')
 
 
 @login_required
@@ -35,17 +58,6 @@ def add_comment(request, post_id):
     return redirect('blog:post_detail', post_id=post_id)
 
 
-def get_comment_post(post_id, comment_id):
-    """
-    Получает объект комментария по его идентификатору
-    внутри заданного поста.
-    """
-    return get_object_or_404(
-        Comment.objects.filter(pk=comment_id),
-        post=post_id
-    )
-
-
 @login_required
 def edit_comment(request, post_id, comment_id):
     """
@@ -53,7 +65,7 @@ def edit_comment(request, post_id, comment_id):
     который отправил запрос не является автором комментария,
     его перенаправляет на страницу публикации.
     """
-    instance = get_comment_post(post_id, comment_id)
+    instance = get_object_or_404(Comment, pk=comment_id, post=post_id)
 
     if request.user != instance.author:
         return redirect('blog:post_detail', post_id=post_id)
@@ -74,7 +86,7 @@ def delete_comment(request, post_id, comment_id):
     Если пользователь, который отправил запрос не является автором
     комментария, его перенаправляет на страницу публикации.
     """
-    instance = get_comment_post(post_id, comment_id)
+    instance = get_object_or_404(Comment, pk=comment_id, post=post_id)
 
     if request.user != instance.author:
         return redirect('blog:post_detail', post_id=post_id)
@@ -83,31 +95,6 @@ def delete_comment(request, post_id, comment_id):
         instance.delete()
         return redirect('blog:post_detail', post_id=post_id)
     return render(request, 'blog/comment.html')
-
-
-def get_posts(add_filter=False, add_comments=False):
-    """
-    Получает набор публикаций из базы данных с возможностью применения
-    фильтров и предзагрузки комментариев.
-    Публикации загружаются с использованием оптимизации запросов,
-    чтобы уменьшить количество обращений к базе данных.
-    """
-    qwery = Post.objects.select_related(
-        'author',
-        'category',
-        'location'
-    )
-    if add_filter:
-        qwery = qwery.filter(
-            pub_date__lte=timezone.now(),
-            is_published=True,
-            category__is_published=True
-        )
-    if add_comments:
-        qwery = qwery.prefetch_related('comments')
-    return qwery.annotate(
-        comment_count=Count('comments')
-    ).order_by('-pub_date', 'title')
 
 
 class OnlyAuthorMixin(UserPassesTestMixin):
@@ -132,9 +119,9 @@ class PostsListView(ListView):
 
     model = Post
     template_name = 'blog/index.html'
-    queryset = get_posts(add_filter=True)
+    queryset = get_posts(add_filter=True, add_comments=True)
 
-    paginate_by = COUNT_POSTS
+    paginate_by = settings.COUNT_POSTS
 
 
 class PostCreateView(LoginRequiredMixin, CreateView):
@@ -183,16 +170,18 @@ def post_detail(request, post_id):
     его может посмотреть только автор.
     """
     post = get_object_or_404(
-        get_posts(add_filter=False, add_comments=True),
+        get_posts(),
         pk=post_id
     )
 
-    if post.author != request.user:
-        if (
+    if (
+        post.author != request.user
+        and (
             not post.is_published or not post.category.is_published
             or post.pub_date > timezone.now()
-        ):
-            raise Http404()
+        )
+    ):
+        raise Http404()
 
     comments = post.comments.select_related('author')
     form = CommentForm()
@@ -249,11 +238,12 @@ class ProfileUpdateView(LoginRequiredMixin, UpdateView):
         return reverse('blog:profile', kwargs={'username': user.username})
 
 
-def get_page_obj(request, paginator):
+def get_page_obj(request, query):
     """
     Получает объект страницы из пагинатора на основе номера страницы,
     указанного в параметрах запроса.
     """
+    paginator = Paginator(query, settings.COUNT_POSTS)
     page_number = request.GET.get('page')
     return paginator.get_page(page_number)
 
@@ -268,18 +258,13 @@ def profile_details(request, username):
         username=username
     )
 
-    if request.user == profile:
-        posts = get_posts()
-    else:
-        posts = get_posts(add_filter=True)
-
-    paginator = Paginator(
-        posts.filter(author=profile), COUNT_POSTS
-    )
+    posts = get_posts(add_filter=request.user != profile, add_comments=True)
 
     context = {
         'profile': profile,
-        'page_obj': get_page_obj(request, paginator)
+        'page_obj': get_page_obj(
+            request, posts.filter(author=profile)
+        )
     }
 
     return render(request, 'blog/profile.html', context)
@@ -294,13 +279,10 @@ def category_posts(request, category_slug):
         is_published=True,
     )
 
-    paginator = Paginator(
-        get_posts(add_filter=True).filter(category=category),
-        COUNT_POSTS
-    )
-
     context = {
         'category': category,
-        'page_obj': get_page_obj(request, paginator)
+        'page_obj': get_page_obj(
+            request, get_posts(add_filter=True).filter(category=category)
+        )
     }
     return render(request, 'blog/category.html', context)
